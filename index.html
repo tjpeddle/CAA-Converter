@@ -144,6 +144,26 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
   button.dl:hover { background: var(--purple-dark); }
 
+  .review-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 4px; border-top: 1px solid var(--line);
+  }
+  .review-item:first-of-type { border-top: none; }
+  .review-item input[type="checkbox"] {
+    width: 18px; height: 18px; accent-color: var(--purple);
+    cursor: pointer; flex-shrink: 0;
+  }
+  .review-item .info { flex: 1; min-width: 0; }
+  .review-item .who { font-weight: 600; font-size: .88rem; }
+  .review-item .crs { font-size: .78rem; color: var(--muted); }
+  .done-badge {
+    display: inline-block; font-size: .66rem; font-weight: 700; color: #fff;
+    background: var(--gold); border-radius: 10px; padding: 2px 8px;
+    margin-left: 8px; vertical-align: middle; letter-spacing: .3px;
+  }
+  .mini-links { margin-top: 12px; font-size: .78rem; }
+  .mini-links a { color: var(--purple); cursor: pointer; text-decoration: underline; margin-right: 14px; }
+  .mini-links .mem { color: var(--muted); }
   #status { font-size: .85rem; margin-top: 12px; color: var(--muted); min-height: 1.2em; }
   #status.error { color: var(--err); font-weight: 600; }
   .hidden { display: none; }
@@ -177,10 +197,26 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       <input type="file" id="tmplInput" accept=".docx">
       <div id="tmplNote" class="tmpl-note hidden"></div>
     </div>
+    <div class="options">
+      New browser or computer?
+      <a id="rebuildLink">Rebuild history from previously generated Word files&hellip;</a>
+      <input type="file" id="rebuildInput" accept=".docx" multiple>
+      <div id="rebuildNote" class="tmpl-note hidden"></div>
+    </div>
+  </div>
+
+  <div class="card hidden" id="reviewCard">
+    <div class="step-label">Step 2 · Review responses</div>
+    <div id="reviewList"></div>
+    <div class="mini-links">
+      <a id="checkAll">Check all</a><a id="uncheckAll">Uncheck all</a>
+      <span class="mem" id="memInfo"></span>
+      <a id="resetMem" class="hidden">Forget history</a>
+    </div>
   </div>
 
   <div class="card">
-    <div class="step-label">Step 2 · Generate the completed agreements</div>
+    <div class="step-label">Step 3 · Generate the completed agreements</div>
     <button class="primary" id="goBtn" disabled>Generate individual Word documents</button>
     <div id="status"></div>
   </div>
@@ -194,7 +230,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   </div>
 </main>
 
-<footer>One Word document per instructor, named LastName_Course-Section.docx &mdash; ready to review and email to the instructor or file with OARS.</footer>
+<footer>One Word document per instructor, named LastName_Course-Section.docx. Forms exports are cumulative &mdash; this tool remembers (in this browser only) which responses it already generated, so repeat exports only produce the new ones.</footer>
 
 <script>
 /* ================= embedded blank form (base64 .docx) ================= */
@@ -376,15 +412,68 @@ function readRows(arrayBuffer){
       row[field] = clean(cell ? (cell.w !== undefined && typeof cell.v !== "string" ? cell.w : cell.v) : "");
       if (row[field]) any = true;
     }
-    if (any) rows.push({ excelRow: r + 1, data: row });
+    const idCell = ws["A" + (r + 1)];             /* Forms response ID */
+    const id = idCell ? clean(idCell.v) : "";
+    if (any) rows.push({ excelRow: r + 1, id, data: row });
   }
   return rows;
+}
+
+/* ================= generation memory =================
+   Forms exports are cumulative, so remember (per browser) which
+   response IDs have already been generated. Filename is irrelevant. */
+const MEM_KEY = "oars_absence_generated_v1";
+function loadMem(){
+  try { return new Set(JSON.parse(localStorage.getItem(MEM_KEY) || "[]")); }
+  catch (e){ return new Set(); }
+}
+function saveMem(set){
+  try { localStorage.setItem(MEM_KEY, JSON.stringify(Array.from(set))); }
+  catch (e){ /* private mode etc. — memory just won't persist */ }
+}
+function rowKey(r){
+  return r.id ? "id:" + r.id
+              : "k:" + norm((r.data.instructor || "") + "|" + (r.data.course_section || ""));
+}
+
+/* Stamp the response key into the generated .docx as a hidden custom
+   document property, so the files in SharePoint ARE the history and
+   memory can be rebuilt from them on any machine. */
+async function stampKey(zip, key){
+  zip.file("docProps/custom.xml",
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' +
+    '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" ' +
+    'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">' +
+    '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="OARSResponseKey">' +
+    "<vt:lpwstr>" + xmlEscape(key) + "</vt:lpwstr></property></Properties>");
+  let ct = await zip.file("[Content_Types].xml").async("string");
+  if (!ct.includes("/docProps/custom.xml")){
+    ct = ct.replace("</Types>",
+      '<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/></Types>');
+    zip.file("[Content_Types].xml", ct);
+  }
+  let rels = await zip.file("_rels/.rels").async("string");
+  if (!rels.includes("custom-properties")){
+    rels = rels.replace("</Relationships>",
+      '<Relationship Id="rIdOarsCustom" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties" Target="docProps/custom.xml"/></Relationships>');
+    zip.file("_rels/.rels", rels);
+  }
+}
+async function readStamp(arrayBuffer){
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const part = zip.file("docProps/custom.xml");
+  if (!part) return null;
+  const m = (await part.async("string"))
+    .match(/name="OARSResponseKey"[^>]*>\s*<vt:lpwstr>([^<]+)<\/vt:lpwstr>/);
+  if (!m) return null;
+  return m[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
 /* ================= app state & UI ================= */
 let xlsxBuffer = null, xlsxName = "";
 let templateBuffer = null, templateName = "built-in blank form (REV 3/2026)";
-let results = [];   /* {name, blob, meta, warnings} */
+let parsedRows = [];   /* {excelRow, id, data} */
+let results = [];      /* {name, blob, meta, warnings} */
 
 const $ = id => document.getElementById(id);
 const dropzone = $("dropzone"), goBtn = $("goBtn"), statusEl = $("status");
@@ -399,7 +488,13 @@ function setStatus(msg, isError){
   statusEl.textContent = msg;
   statusEl.className = isError ? "error" : "";
 }
-function refreshGo(){ goBtn.disabled = !xlsxBuffer; }
+function refreshGo(){
+  const n = xlsxBuffer ? checkedRows().length : 0;
+  goBtn.disabled = n === 0;
+  goBtn.textContent = n
+    ? "Generate " + n + " Word document" + (n === 1 ? "" : "s")
+    : "Generate individual Word documents";
+}
 
 dropzone.addEventListener("click", () => $("xlsxInput").click());
 ["dragover","dragenter"].forEach(ev => dropzone.addEventListener(ev, e => {
@@ -427,10 +522,110 @@ function loadXlsx(file){
     tag.innerHTML = "&#9989; <b>" + file.name.replace(/</g,"&lt;") + "</b>&nbsp;loaded";
     tag.classList.remove("hidden");
     setStatus("");
+    try {
+      parsedRows = readRows(xlsxBuffer);
+      renderReview();
+    } catch (err){
+      parsedRows = [];
+      $("reviewCard").classList.add("hidden");
+      setStatus("⚠ Couldn’t read that spreadsheet: " + err.message, true);
+    }
     refreshGo();
   };
   reader.readAsArrayBuffer(file);
 }
+
+/* ---------- review list ---------- */
+function esc(s){ return String(s).replace(/</g, "&lt;"); }
+function renderReview(){
+  const mem = loadMem();
+  const list = $("reviewList");
+  list.innerHTML = "";
+  let newCount = 0, doneCount = 0;
+
+  parsedRows.forEach((r, i) => {
+    const div = document.createElement("div");
+    div.className = "review-item";
+    const valid = r.data.instructor || r.data.course_section;
+    if (!valid){
+      div.innerHTML = '<div class="info"><div class="crs" style="color:var(--err)">Row ' +
+        r.excelRow + " — no instructor name or course/section, will be skipped.</div></div>";
+      list.appendChild(div);
+      return;
+    }
+    const done = mem.has(rowKey(r));
+    if (done) doneCount++; else newCount++;
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !done;                 /* new rows pre-checked, done rows unchecked */
+    cb.dataset.idx = i;
+    cb.addEventListener("change", refreshGo);
+    div.appendChild(cb);
+    const info = document.createElement("div");
+    info.className = "info";
+    info.innerHTML =
+      '<div class="who">' + esc(r.data.instructor || "(no instructor)") +
+        (done ? '<span class="done-badge">done previously</span>' : "") + "</div>" +
+      '<div class="crs">' + esc(r.data.course_name || "") +
+        (r.data.course_section ? " · " + esc(r.data.course_section) : "") +
+        " · row " + r.excelRow + "</div>";
+    div.appendChild(info);
+    list.appendChild(div);
+  });
+
+  $("reviewCard").classList.remove("hidden");
+  const memInfo = $("memInfo");
+  memInfo.textContent = doneCount
+    ? doneCount + " response" + (doneCount === 1 ? "" : "s") + " generated on a previous run."
+    : (newCount ? "All responses are new." : "");
+  const resetLink = $("resetMem");
+  resetLink.classList.toggle("hidden", loadMem().size === 0);
+  refreshGo();
+}
+function checkedRows(){
+  return Array.from(document.querySelectorAll('#reviewList input[type="checkbox"]'))
+    .filter(cb => cb.checked)
+    .map(cb => parsedRows[+cb.dataset.idx]);
+}
+$("checkAll").addEventListener("click", () => {
+  document.querySelectorAll('#reviewList input[type="checkbox"]').forEach(cb => cb.checked = true);
+  refreshGo();
+});
+$("uncheckAll").addEventListener("click", () => {
+  document.querySelectorAll('#reviewList input[type="checkbox"]').forEach(cb => cb.checked = false);
+  refreshGo();
+});
+$("rebuildLink").addEventListener("click", () => $("rebuildInput").click());
+$("rebuildInput").addEventListener("change", async e => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  const note = $("rebuildNote");
+  note.classList.remove("hidden");
+  note.textContent = "Reading " + files.length + " file(s)…";
+  const mem = loadMem();
+  let restored = 0, already = 0, skipped = 0;
+  for (const f of files){
+    try {
+      const key = await readStamp(await f.arrayBuffer());
+      if (!key) skipped++;
+      else if (mem.has(key)) already++;
+      else { mem.add(key); restored++; }
+    } catch (err){ skipped++; }
+  }
+  saveMem(mem);
+  const bits = [restored + " restored"];
+  if (already) bits.push(already + " already remembered");
+  if (skipped) bits.push(skipped + " skipped (not generated by this tool)");
+  note.textContent = "✔ History rebuilt: " + bits.join(", ") + ".";
+  e.target.value = "";
+  if (parsedRows.length) renderReview();
+});
+$("resetMem").addEventListener("click", () => {
+  saveMem(new Set());
+  if (parsedRows.length) renderReview();
+  else $("resetMem").classList.add("hidden");
+  setStatus("Generation history cleared — every response now counts as new.");
+});
 $("tmplLink").addEventListener("click", () => $("tmplInput").click());
 $("tmplInput").addEventListener("change", e => {
   const f = e.target.files[0];
@@ -457,24 +652,24 @@ goBtn.addEventListener("click", async () => {
     if (templateXml.indexOf('w:fill="FFFFDF"') === -1)
       throw new Error("This blank form doesn’t match the expected agreement template.");
 
-    const rows = readRows(xlsxBuffer);
-    if (!rows.length) throw new Error("No completed responses found in the spreadsheet.");
+    const rows = checkedRows();
+    if (!rows.length) throw new Error("No responses are checked in the review list.");
 
     results = [];
     const used = new Set();
     const list = $("resultsList");
     list.innerHTML = "";
     let made = 0;
+    const generatedKeys = [];
 
-    for (const { excelRow, data } of rows){
-      if (!data.instructor && !data.course_section){
-        addResultRow(null, null, "Row " + excelRow + " skipped — no instructor name or course/section.", null);
-        continue;
-      }
+    for (const r of rows){
+      const { excelRow, data } = r;
+      if (!data.instructor && !data.course_section) continue;
       setStatus("Filling form for row " + excelRow + "…");
       const { xml, warnings } = fillForm(templateXml, data);
       const outZip = await JSZip.loadAsync(tmplBuf);   /* fresh copy each time */
       outZip.file("word/document.xml", xml);
+      await stampKey(outZip, rowKey(r));               /* hidden fail-safe stamp */
       const blob = await outZip.generateAsync({
         type: "blob", compression: "DEFLATE",
         mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -483,8 +678,13 @@ goBtn.addEventListener("click", async () => {
       const meta = (data.instructor || "?") + " · " + (data.course_name || data.course_section || "");
       results.push({ name, blob, meta, warnings });
       addResultRow(name, meta, null, warnings);
+      generatedKeys.push(rowKey(r));
       made++;
     }
+    const mem = loadMem();                 /* remember what was just generated */
+    generatedKeys.forEach(k => mem.add(k));
+    saveMem(mem);
+    renderReview();
     window.APP_RESULTS = results;   /* for troubleshooting */
     $("resultsTitle").textContent = "Completed agreements (" + made + ")";
     $("resultsCard").classList.remove("hidden");
@@ -494,7 +694,7 @@ goBtn.addEventListener("click", async () => {
   } catch (err){
     setStatus("⚠ " + err.message, true);
   }
-  goBtn.disabled = false;
+  refreshGo();
 });
 
 function addResultRow(name, meta, skipMsg, warnings){
