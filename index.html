@@ -161,6 +161,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     background: var(--gold); border-radius: 10px; padding: 2px 8px;
     margin-left: 8px; vertical-align: middle; letter-spacing: .3px;
   }
+  .admin-line { font-size: .78rem; color: var(--ink); margin-top: 3px; }
+  .kind-badge {
+    display: inline-block; font-size: .66rem; font-weight: 700;
+    border-radius: 10px; padding: 2px 8px; margin-left: 6px;
+    vertical-align: middle; letter-spacing: .3px;
+  }
+  .kind-badge.correction { background: #fdecea; color: var(--err); border: 1px solid #f3b7b1; }
+  .kind-badge.new { background: var(--purple-light); color: var(--purple-dark); border: 1px solid #cfc3e6; }
   .mini-links { margin-top: 12px; font-size: .78rem; }
   .mini-links a { color: var(--purple); cursor: pointer; text-decoration: underline; margin-right: 14px; }
   .mini-links .mem { color: var(--muted); }
@@ -240,7 +248,8 @@ const TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQBKdIS01wEAADUMAAATAAgCW0NvbnRlbnRfVHlwZX
    The blank agreement is a fixed template (REV 3/2026):
    - 15 light-yellow answer cells (14 shaded FFFFDF + 1 shaded FFFFD9)
    - 28 checkbox content controls, in a known document order.
-   Values come from spreadsheet columns G..AA.                      */
+   Values come from the agreement block of the export (originally
+   columns G..AA; located by header at read time — see readRows).   */
 
 const COLS = {
   instructor:"G", course_name:"H", course_section:"I", attendance:"J",
@@ -398,25 +407,82 @@ function buildFilename(row, used){
   return name + ".docx";
 }
 
-/* ================= spreadsheet reading ================= */
+/* ================= spreadsheet reading =================
+   Columns are located by HEADER, not by letter, so questions added to
+   the Form (e.g. semester / correction at the top) can't shift answers
+   into the wrong boxes. The agreement block (Instructor Name .. Additional
+   info) is found via its "Instructor Name" header; COLS letters above are
+   used only as offsets within that block.                             */
+function cellText(cell){
+  return clean(cell ? (cell.w !== undefined && typeof cell.v !== "string" ? cell.w : cell.v) : "");
+}
+function locateColumns(ws, range){
+  const headers = [];
+  for (let c = range.s.c; c <= range.e.c; c++)
+    headers.push({ c, n: norm(cellText(ws[XLSX.utils.encode_cell({ r: range.s.r, c })])) });
+
+  const anchor = headers.find(h => h.n === "instructorname");
+  if (!anchor) throw new Error("Couldn’t find the “Instructor Name” column in this spreadsheet. " +
+    "Make sure it’s the Excel export from the Consideration for Absences Form.");
+
+  const base = XLSX.utils.decode_col(COLS.instructor);
+  const map = {};
+  for (const [field, letter] of Object.entries(COLS))
+    map[field] = anchor.c + (XLSX.utils.decode_col(letter) - base);
+
+  /* sanity check: a few headers must be where the block layout says */
+  const headerAt = c => (headers.find(h => h.c === c) || { n: "" }).n;
+  const checks = [
+    ["course_name", "coursename", "Course Name"],
+    ["course_section", "section", "Course and Section Number"],
+    ["attendance", "attendance", "Attendance policy"],
+    ["timeframe", "timeframe", "Time frame for making up assessments"],
+    ["additional", "additionalinformation", "Additional information"]
+  ];
+  const bad = checks.filter(([f, key]) => !headerAt(map[f]).includes(key));
+  if (bad.length) throw new Error("The Form’s questions appear to have been reordered or renamed " +
+    "inside the agreement section (couldn’t find: " + bad.map(b => "“" + b[2] + "”").join(", ") +
+    " where expected). No documents were generated — the tool needs updating to match the new Form.");
+
+  /* admin-only questions (shown in the tool, never written to the Word doc) */
+  const semester = headers.find(h => h.n.includes("semester"));
+  const kind = headers.find(h => h.n.includes("correction"));
+  return { map, semesterCol: semester ? semester.c : -1, kindCol: kind ? kind.c : -1 };
+}
 function readRows(arrayBuffer){
   const wb = XLSX.read(arrayBuffer, { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
   const range = XLSX.utils.decode_range(ws["!ref"]);
+  const { map, semesterCol, kindCol } = locateColumns(ws, range);
+  const at = (r, c) => c < 0 ? "" : cellText(ws[XLSX.utils.encode_cell({ r, c })]);
   const rows = [];
-  for (let r = 1; r <= range.e.r; r++){          /* skip header row */
+  for (let r = range.s.r + 1; r <= range.e.r; r++){   /* skip header row */
     const row = {};
     let any = false;
-    for (const [field, col] of Object.entries(COLS)){
-      const cell = ws[col + (r + 1)];
-      row[field] = clean(cell ? (cell.w !== undefined && typeof cell.v !== "string" ? cell.w : cell.v) : "");
+    for (const [field, c] of Object.entries(map)){
+      row[field] = at(r, c);
       if (row[field]) any = true;
     }
-    const idCell = ws["A" + (r + 1)];             /* Forms response ID */
-    const id = idCell ? clean(idCell.v) : "";
-    if (any) rows.push({ excelRow: r + 1, id, data: row });
+    const id = at(r, 0);                             /* Forms response ID (column A) */
+    const admin = { semester: at(r, semesterCol), kind: at(r, kindCol) };
+    if (any) rows.push({ excelRow: r + 1, id, data: row, admin });
   }
   return rows;
+}
+/* "Correction" / "New" badge + semester line, built from the admin answers */
+function adminHtml(admin){
+  if (!admin || (!admin.semester && !admin.kind)) return "";
+  let badge = "";
+  if (admin.kind){
+    const isCorr = norm(admin.kind).includes("correction");
+    badge = '<span class="kind-badge ' + (isCorr ? "correction" : "new") + '" title="' +
+      esc(admin.kind).replace(/"/g, "&quot;") + '">' +
+      (isCorr ? "CORRECTION" : (norm(admin.kind).includes("new") ? "NEW AGREEMENT" : esc(admin.kind))) +
+      "</span>";
+  }
+  return '<div class="admin-line">' +
+    (admin.semester ? "Semester: <b>" + esc(admin.semester) + "</b>" : "Semester: —") +
+    badge + "</div>";
 }
 
 /* ================= generation memory =================
@@ -568,7 +634,8 @@ function renderReview(){
         (done ? '<span class="done-badge">done previously</span>' : "") + "</div>" +
       '<div class="crs">' + esc(r.data.course_name || "") +
         (r.data.course_section ? " · " + esc(r.data.course_section) : "") +
-        " · row " + r.excelRow + "</div>";
+        " · row " + r.excelRow + "</div>" +
+      adminHtml(r.admin);
     div.appendChild(info);
     list.appendChild(div);
   });
@@ -676,8 +743,8 @@ goBtn.addEventListener("click", async () => {
       });
       const name = buildFilename(data, used);
       const meta = (data.instructor || "?") + " · " + (data.course_name || data.course_section || "");
-      results.push({ name, blob, meta, warnings });
-      addResultRow(name, meta, null, warnings);
+      results.push({ name, blob, meta, warnings, admin: r.admin });
+      addResultRow(name, meta, null, warnings, r.admin);
       generatedKeys.push(rowKey(r));
       made++;
     }
@@ -697,7 +764,7 @@ goBtn.addEventListener("click", async () => {
   refreshGo();
 });
 
-function addResultRow(name, meta, skipMsg, warnings){
+function addResultRow(name, meta, skipMsg, warnings, admin){
   const div = document.createElement("div");
   div.className = "row-item";
   const info = document.createElement("div");
@@ -707,7 +774,8 @@ function addResultRow(name, meta, skipMsg, warnings){
     div.appendChild(info);
   } else {
     let html = '<div class="fname">' + name.replace(/</g,"&lt;") + "</div>" +
-               '<div class="meta">' + meta.replace(/</g,"&lt;") + "</div>";
+               '<div class="meta">' + meta.replace(/</g,"&lt;") + "</div>" +
+               adminHtml(admin);
     (warnings || []).forEach(w => { html += '<div class="warn">⚠ ' + w.replace(/</g,"&lt;") + "</div>"; });
     info.innerHTML = html;
     div.appendChild(info);
